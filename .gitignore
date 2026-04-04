@@ -1,0 +1,5 @@
+linkedin_sent_requests.csv
+*.json
+__pycache__/
+*.pyc
+.env
