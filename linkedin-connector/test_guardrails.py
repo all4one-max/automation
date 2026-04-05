@@ -5,7 +5,7 @@ sys.path.insert(0, '.')
 from linkedin_connector import (
     is_india, is_leadership, count_sent_today, count_sent_this_week,
     compute_acceptance_stats, build_search_url,
-    CAPTCHA_SIGNALS, RATE_LIMIT_SIGNALS, WEEKLY_LIMIT, DAILY_LIMIT
+    CAPTCHA_SIGNALS_URL, CAPTCHA_SIGNALS_BODY, RATE_LIMIT_SIGNALS, WEEKLY_LIMIT, DAILY_LIMIT
 )
 from datetime import date, timedelta
 
@@ -66,10 +66,12 @@ test("Contains geoUrn", "geoUrn=" in url)
 test("HTTPS URL", url.startswith("https://"))
 
 print("\n── CAPTCHA / rate-limit signals (NEW) ──")
-test("CAPTCHA signals non-empty", len(CAPTCHA_SIGNALS) > 0)
+test("CAPTCHA URL signals non-empty", len(CAPTCHA_SIGNALS_URL) > 0)
+test("CAPTCHA body signals non-empty", len(CAPTCHA_SIGNALS_BODY) > 0)
 test("Rate-limit signals non-empty", len(RATE_LIMIT_SIGNALS) > 0)
-test("security verification in CAPTCHA", "security verification" in CAPTCHA_SIGNALS)
-test("/checkpoint/ in CAPTCHA", "/checkpoint/" in CAPTCHA_SIGNALS)
+test("security verification in CAPTCHA body", "security verification" in CAPTCHA_SIGNALS_BODY)
+test("/checkpoint/ in CAPTCHA URL", "/checkpoint/" in CAPTCHA_SIGNALS_URL)
+test("'challenge' NOT a body signal (too generic)", "challenge" not in CAPTCHA_SIGNALS_BODY)
 test("weekly invitation limit in rate-limit", "you've reached the weekly invitation limit" in RATE_LIMIT_SIGNALS)
 test("temporarily restricted in rate-limit", "temporarily restricted" in RATE_LIMIT_SIGNALS)
 

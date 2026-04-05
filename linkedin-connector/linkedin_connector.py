@@ -77,13 +77,20 @@ WEEKLY_LIMIT    = 150
 SESSION_DEFAULT = 50
 
 # ── CAPTCHA / restriction detection keywords ─────────────────────────────────
-CAPTCHA_SIGNALS = [
+# Only match very specific phrases to avoid false positives on normal profile pages.
+# Single words like "challenge" can appear in job descriptions, ads, etc.
+CAPTCHA_SIGNALS_URL = [
+    "/checkpoint/",
+    "/challenge/",
+]
+
+CAPTCHA_SIGNALS_BODY = [
     "security verification",
     "let's do a quick security check",
     "verify you're a real person",
-    "unusual activity",
-    "challenge",
-    "/checkpoint/",
+    "please verify you're not a robot",
+    "unusual activity detected",
+    "we've detected unusual activity",
 ]
 
 RATE_LIMIT_SIGNALS = [
@@ -258,14 +265,16 @@ def is_india(*fields: str) -> bool:
 async def check_for_captcha(page: Page) -> bool:
     """
     Detect if LinkedIn is showing a CAPTCHA or security challenge.
-    Returns True if a CAPTCHA/challenge is detected.
+    Uses URL checks first (fast), then specific body text phrases (no single-word matches).
     """
     try:
         url = page.url.lower()
-        if "/checkpoint/" in url or "challenge" in url:
+        # URL-based detection (most reliable)
+        if any(signal in url for signal in CAPTCHA_SIGNALS_URL):
             return True
+        # Body text detection — only very specific phrases to avoid false positives
         page_text = await page.evaluate("document.body ? document.body.innerText.toLowerCase() : ''")
-        return any(signal in page_text for signal in CAPTCHA_SIGNALS)
+        return any(signal in page_text for signal in CAPTCHA_SIGNALS_BODY)
     except Exception:
         return False
 
