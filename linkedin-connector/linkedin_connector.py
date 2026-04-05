@@ -282,13 +282,38 @@ async def check_for_rate_limit(page: Page) -> bool:
         return False
 
 
-async def safety_check(page: Page) -> str | None:
+async def safety_check(page: Page, pause_on_captcha: bool = True) -> str | None:
     """
-    Run CAPTCHA + rate-limit checks. Returns a reason string if we must stop,
-    or None if safe to continue.
+    Run CAPTCHA + rate-limit checks.
+    - CAPTCHA: pauses and waits for the user to solve it manually, then resumes.
+    - Rate limit: returns a reason string to stop (can't be solved manually).
+    - Returns None if safe to continue.
     """
     if await check_for_captcha(page):
-        return "CAPTCHA_DETECTED"
+        if not pause_on_captcha:
+            return "CAPTCHA_DETECTED"
+
+        print("\n  🛑 CAPTCHA detected! LinkedIn is asking for verification.")
+        print("  👉 Please solve it in the browser window. Waiting...")
+
+        # Poll every 3 seconds until CAPTCHA is gone (user solved it)
+        attempts = 0
+        max_wait = 300  # 5 minutes max
+        while attempts < max_wait // 3:
+            await asyncio.sleep(3)
+            attempts += 1
+            if not await check_for_captcha(page):
+                print("  ✓ CAPTCHA solved! Resuming...\n")
+                await asyncio.sleep(random.uniform(2, 4))  # brief cooldown after solving
+                return None
+            if attempts % 10 == 0:
+                elapsed = attempts * 3
+                print(f"  ... still waiting ({elapsed}s elapsed)")
+
+        # Timed out after 5 minutes
+        print("  ⏰ Waited 5 minutes — CAPTCHA still present. Stopping.")
+        return "CAPTCHA_TIMEOUT"
+
     if await check_for_rate_limit(page):
         return "RATE_LIMIT_REACHED"
     return None
@@ -853,13 +878,11 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
 
                 page = await recover_page(ctx, page)
 
-                # Safety check before search
+                # Safety check before search (CAPTCHA will pause and wait for user to solve)
                 stop_reason = await safety_check(page)
                 if stop_reason:
-                    print(f"\n  🛑 {stop_reason} — stopping immediately.")
-                    if stop_reason == "CAPTCHA_DETECTED":
-                        print("  LinkedIn is showing a CAPTCHA. Solve it manually and try again later.")
-                    elif stop_reason == "RATE_LIMIT_REACHED":
+                    print(f"\n  🛑 {stop_reason} — stopping.")
+                    if stop_reason == "RATE_LIMIT_REACHED":
                         print("  LinkedIn has rate-limited your account. Wait 24-48 hours before retrying.")
                     await ctx.close()
                     return
@@ -916,13 +939,11 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
                         page = await recover_page(ctx, page)
                         continue
 
-                    # Safety check after profile interaction
+                    # Safety check after profile interaction (CAPTCHA will pause and wait)
                     stop_reason = await safety_check(page)
                     if stop_reason:
-                        print(f"\n  🛑 {stop_reason} — stopping immediately.")
-                        if stop_reason == "CAPTCHA_DETECTED":
-                            print("  LinkedIn is showing a CAPTCHA. Solve it manually and try again later.")
-                        elif stop_reason == "RATE_LIMIT_REACHED":
+                        print(f"\n  🛑 {stop_reason} — stopping.")
+                        if stop_reason == "RATE_LIMIT_REACHED":
                             print("  LinkedIn has rate-limited your account. Wait 24-48 hours before retrying.")
                         await ctx.close()
                         return
