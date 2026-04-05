@@ -534,9 +534,8 @@ async def click_next_page(page: Page):
 async def handle_connect_modal(page: Page) -> bool:
     """
     Handle the connection modal.
-    If note is provided: click 'Add a note', type it, send.
-    If no note: click 'Send without a note'.
-    If no modal appears, LinkedIn auto-sent — treat as success.
+    Clicks 'Send without a note'. Returns True only if send is confirmed
+    via button click or success toast. Returns False if uncertain.
     """
     MODAL_SELS = ['[role="dialog"]', '.artdeco-modal', '.send-invite', '.invitation-modal']
 
@@ -585,13 +584,8 @@ async def handle_connect_modal(page: Page) -> bool:
         await asyncio.sleep(random.uniform(1.5, 2.5))
         return True
 
-    try:
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1.5)
-        return True
-    except Exception:
-        pass
-
+    # Don't blindly press Enter — it could trigger unintended actions
+    print("    [warning] Send button not found in modal — not counting as sent")
     return False
 
 
@@ -654,11 +648,11 @@ async def _send_connection_on_profile_impl(
         print(f"    – Not leadership on profile ({title[:50]}), skipping")
         return False, name, location
 
-    # Skip if already connected (1st degree — Message button visible, no Connect)
+    # Skip if already connected (1st degree — Message button in main profile actions)
     try:
-        # Use wait_for_selector with short timeout instead of query_selector to avoid hanging
+        # Use :text-is for exact match to avoid matching "Messaging" in navbar
         msg_btn = await page.wait_for_selector(
-            'button:has-text("Message"), a:has-text("Message")',
+            'main button:text-is("Message"), main a:text-is("Message")',
             timeout=3000,
         )
         if msg_btn and await msg_btn.is_visible():
@@ -867,7 +861,7 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
     else:
         print()
 
-    if session_cap <= 0 and not dry_run:
+    if session_cap <= 0:
         if weekly_left <= 0:
             print("  Weekly limit reached. Try again next week or use --check-acceptance to review stats.")
         else:
@@ -879,6 +873,7 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
     skip_sent       = 0
     skip_no_connect = 0
     seen_this_run: set[str] = set()
+    next_break_at   = random.randint(8, 15)  # take a break after this many sends
 
     async with async_playwright() as pw:
         global _browser_ctx
@@ -893,14 +888,14 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
         print(f"  Search order : {', '.join(keywords)}\n")
 
         for keyword in keywords:
-            if sent_count >= session_cap and not dry_run:
+            if sent_count >= session_cap:
                 break
 
             print(f"\n── '{keyword}' ──────────────────────────────────────")
             page_num = 1
 
             while True:
-                if sent_count >= session_cap and not dry_run:
+                if sent_count >= session_cap:
                     break
 
                 search_url = build_search_url(keyword, page_num)
@@ -999,11 +994,12 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
                         print(f"    – Connect unavailable (Follow-only / already connected / pending)")
                         continue   # no wait needed — nothing was sent
 
-                    # Occasional long "distraction" break every 8-15 requests
-                    if sent_count > 0 and sent_count % random.randint(8, 15) == 0:
+                    # Occasional long "distraction" break
+                    if sent_count >= next_break_at:
                         long_break = random.uniform(60, 120)
                         print(f"    ☕ Taking a {long_break:.0f}s break (human-like pause) …")
                         await asyncio.sleep(long_break)
+                        next_break_at = sent_count + random.randint(8, 15)
                     else:
                         delay = random.uniform(10, 20)
                         print(f"    Waiting {delay:.0f}s …")
