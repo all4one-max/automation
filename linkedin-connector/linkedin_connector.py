@@ -588,16 +588,13 @@ async def handle_connect_modal(page: Page) -> bool:
 
 # ── Profile page: visit + send connection request ─────────────────────────────
 
-async def send_connection_on_profile(
+async def _send_connection_on_profile_impl(
     page: Page,
     profile_url: str,
     dry_run: bool,
     skip_title_filter: bool = False,
 ) -> tuple[bool, str, str]:
-    """
-    Visit the profile page, find the Connect button, send with note.
-    Returns (success, confirmed_name, confirmed_location).
-    """
+    """Inner implementation — called with a timeout wrapper."""
     try:
         await page.goto(profile_url, wait_until="domcontentloaded", timeout=25000)
     except Exception as e:
@@ -650,23 +647,28 @@ async def send_connection_on_profile(
 
     # Skip if already connected (1st degree — Message button visible, no Connect)
     try:
-        msg_btn = await page.query_selector('button:has-text("Message"), a:has-text("Message")')
+        # Use wait_for_selector with short timeout instead of query_selector to avoid hanging
+        msg_btn = await page.wait_for_selector(
+            'button:has-text("Message"), a:has-text("Message")',
+            timeout=3000,
+        )
         if msg_btn and await msg_btn.is_visible():
             print(f"    – Already connected, skipping")
             return False, name, location
     except Exception:
-        pass
+        pass  # No Message button found — not connected, continue
 
     # Skip if connection request already pending
     try:
-        pending_btn = await page.query_selector(
-            'button:has-text("Pending"), button[aria-label*="Pending" i]'
+        pending_btn = await page.wait_for_selector(
+            'button:has-text("Pending"), button[aria-label*="Pending" i]',
+            timeout=2000,
         )
         if pending_btn and await pending_btn.is_visible():
             print(f"    – Request already pending, skipping")
             return False, name, location
     except Exception:
-        pass
+        pass  # No Pending button — continue
 
     # Step 1: Look for Connect button ONLY for this profile owner (not sidebar/recommendations).
     # Sidebar cards also have "Invite X to connect" buttons — we must filter them out.
@@ -808,6 +810,25 @@ async def send_connection_on_profile(
 
     success = await handle_connect_modal(page)
     return success, name, location
+
+
+async def send_connection_on_profile(
+    page: Page,
+    profile_url: str,
+    dry_run: bool,
+    skip_title_filter: bool = False,
+) -> tuple[bool, str, str]:
+    """
+    Wrapper with 60s timeout — prevents hanging on any single profile.
+    """
+    try:
+        return await asyncio.wait_for(
+            _send_connection_on_profile_impl(page, profile_url, dry_run, skip_title_filter),
+            timeout=60,
+        )
+    except asyncio.TimeoutError:
+        print(f"    – Profile timed out after 60s, skipping")
+        return False, "", ""
 
 
 # ── Main runner ───────────────────────────────────────────────────────────────
