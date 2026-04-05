@@ -1,31 +1,37 @@
 """
 linkedin_connector.py
 ─────────────────────
-Searches LinkedIn for Founders, Co-founders, and Hiring Engineers outside India,
-then sends connection requests with an optional note.
+Searches LinkedIn for Founders, Co-founders, and CTOs outside India,
+then sends connection requests.
 
 Strategy:
   1. Paginate search results, extract profile URLs + card text
   2. Skip India-based profiles (detected from card location text)
   3. Visit each eligible profile page and click "Invite to connect"
-  4. Add optional personalized note, confirm send
+  4. Confirm send (without note)
   5. Log to CSV to avoid duplicate requests
 
 Usage:
-    # Default search (Founder/Co-founder/Hiring Engineer, outside India)
-    python3 tools/linkedin_connector.py
-
-    # Custom note (use {first_name} as placeholder)
-    python3 tools/linkedin_connector.py --note "Hi {first_name}, love what you're building..."
+    # Default search (Founder/Co-founder/CTO, outside India)
+    python3 linkedin-connector/linkedin_connector.py
 
     # Limit requests this session
-    python3 tools/linkedin_connector.py --limit 15
+    python3 linkedin-connector/linkedin_connector.py --limit 15
 
     # Dry run — preview profiles without sending
-    python3 tools/linkedin_connector.py --dry-run
+    python3 linkedin-connector/linkedin_connector.py --dry-run
+
+    # Check which connections were accepted
+    python3 linkedin-connector/linkedin_connector.py --check-acceptance
+
+    # Quick stats from CSV (no browser needed)
+    python3 linkedin-connector/linkedin_connector.py --stats
 
 Safety:
-    - Hard cap: 20 requests/day
+    - Hard cap: 50 requests/day, 150 requests/week (rolling 7 days)
+    - CAPTCHA detection — auto-stops if LinkedIn shows a security challenge
+    - Rate-limit detection — auto-stops if LinkedIn shows invitation limit banner
+    - Acceptance rate tracking — warns if rate drops below 30%
     - Random 10-20s delay between requests
     - Sent requests logged to linkedin_sent_requests.csv
 """
@@ -45,7 +51,28 @@ from playwright.async_api import async_playwright, Page
 USER_DATA       = Path.home() / ".linkedin-harvester-profile"
 SENT_LOG        = Path(__file__).parent / "linkedin_sent_requests.csv"
 DAILY_LIMIT     = 50
+WEEKLY_LIMIT    = 150
 SESSION_DEFAULT = 50
+
+# ── CAPTCHA / restriction detection keywords ─────────────────────────────────
+CAPTCHA_SIGNALS = [
+    "security verification",
+    "let's do a quick security check",
+    "verify you're a real person",
+    "unusual activity",
+    "challenge",
+    "/checkpoint/",
+]
+
+RATE_LIMIT_SIGNALS = [
+    "you've reached the weekly invitation limit",
+    "invitation limit",
+    "too many pending invitations",
+    "you can't send invitations",
+    "withdraw pending invitations",
+    "temporarily restricted",
+    "your account is restricted",
+]
 
 TARGET_TITLES = [
     "Founder",
@@ -135,10 +162,25 @@ def count_sent_today(sent_log: dict) -> int:
     return sum(1 for d in sent_log.values() if d == today)
 
 
+def count_sent_this_week(sent_log: dict) -> int:
+    """Count requests sent in the last 7 days (rolling window)."""
+    today = date.today()
+    count = 0
+    for d in sent_log.values():
+        try:
+            sent_date = date.fromisoformat(d)
+            if (today - sent_date).days < 7:
+                count += 1
+        except (ValueError, TypeError):
+            pass
+    return count
+
+
 def append_sent_log(profile_url: str, name: str, location: str, title: str):
     is_new = not SENT_LOG.exists()
+    fieldnames = ["profile_url", "name", "location", "title", "date_sent", "accepted"]
     with open(SENT_LOG, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["profile_url", "name", "location", "title", "date_sent"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if is_new:
             writer.writeheader()
         writer.writerow({
@@ -147,7 +189,25 @@ def append_sent_log(profile_url: str, name: str, location: str, title: str):
             "location": location,
             "title": title,
             "date_sent": str(date.today()),
+            "accepted": "",  # filled in by --check-acceptance
         })
+
+
+def compute_acceptance_stats(sent_log: dict) -> dict:
+    """Compute acceptance rate stats from the CSV log."""
+    if not SENT_LOG.exists():
+        return {"total": 0, "accepted": 0, "pending": 0, "rate": 0.0}
+
+    total = accepted = 0
+    with open(SENT_LOG, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            total += 1
+            if row.get("accepted", "").lower() == "yes":
+                accepted += 1
+
+    pending = total - accepted
+    rate = (accepted / total * 100) if total > 0 else 0.0
+    return {"total": total, "accepted": accepted, "pending": pending, "rate": rate}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -156,6 +216,45 @@ def is_india(*fields: str) -> bool:
     """Check any number of text fields (location, title, headline) for India signals."""
     combined = " ".join(f.lower() for f in fields if f)
     return any(t in combined for t in INDIA_TOKENS)
+
+
+async def check_for_captcha(page: Page) -> bool:
+    """
+    Detect if LinkedIn is showing a CAPTCHA or security challenge.
+    Returns True if a CAPTCHA/challenge is detected.
+    """
+    try:
+        url = page.url.lower()
+        if "/checkpoint/" in url or "challenge" in url:
+            return True
+        page_text = await page.evaluate("document.body ? document.body.innerText.toLowerCase() : ''")
+        return any(signal in page_text for signal in CAPTCHA_SIGNALS)
+    except Exception:
+        return False
+
+
+async def check_for_rate_limit(page: Page) -> bool:
+    """
+    Detect if LinkedIn is showing a rate-limit or restriction banner.
+    Returns True if a restriction is detected.
+    """
+    try:
+        page_text = await page.evaluate("document.body ? document.body.innerText.toLowerCase() : ''")
+        return any(signal in page_text for signal in RATE_LIMIT_SIGNALS)
+    except Exception:
+        return False
+
+
+async def safety_check(page: Page) -> str | None:
+    """
+    Run CAPTCHA + rate-limit checks. Returns a reason string if we must stop,
+    or None if safe to continue.
+    """
+    if await check_for_captcha(page):
+        return "CAPTCHA_DETECTED"
+    if await check_for_rate_limit(page):
+        return "RATE_LIMIT_REACHED"
+    return None
 
 
 def build_search_url(keyword: str, page_num: int = 1) -> str:
@@ -707,22 +806,35 @@ async def get_connect_buttons_from_page(page: Page) -> list[tuple]:
 # ── Main runner ───────────────────────────────────────────────────────────────
 
 async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False):
-    sent_log    = load_sent_log()
-    sent_today  = count_sent_today(sent_log)
-    session_cap = min(session_limit, DAILY_LIMIT - sent_today)
+    sent_log     = load_sent_log()
+    sent_today   = count_sent_today(sent_log)
+    sent_week    = count_sent_this_week(sent_log)
+    daily_left   = DAILY_LIMIT - sent_today
+    weekly_left  = WEEKLY_LIMIT - sent_week
+    session_cap  = min(session_limit, daily_left, weekly_left)
+
+    # Acceptance rate warning
+    stats = compute_acceptance_stats(sent_log)
 
     print("\nLinkedIn Connector")
-    print(f"  Daily limit  : {DAILY_LIMIT}/day")
-    print(f"  Sent today   : {sent_today}")
+    print(f"  Daily limit  : {DAILY_LIMIT}/day  (sent today: {sent_today})")
+    print(f"  Weekly limit : {WEEKLY_LIMIT}/week (sent this week: {sent_week})")
     print(f"  This session : {session_cap} requests available")
     print(f"  Title filter : {'OFF — any role' if skip_title_filter else 'ON — founders/leadership only'}")
+    if stats["total"] >= 20:
+        print(f"  Accept rate  : {stats['rate']:.1f}% ({stats['accepted']}/{stats['total']})")
+        if stats["rate"] < 30:
+            print(f"  ⚠️  WARNING: Low acceptance rate — account may be at risk")
     if dry_run:
         print(f"  Mode         : DRY RUN (no requests will be sent)\n")
     else:
         print()
 
     if session_cap <= 0 and not dry_run:
-        print("  Daily limit reached. Run again tomorrow.")
+        if weekly_left <= 0:
+            print("  Weekly limit reached. Try again next week or use --check-acceptance to review stats.")
+        else:
+            print("  Daily limit reached. Run again tomorrow.")
         return
 
     sent_count      = 0
@@ -751,6 +863,18 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
                 print(f"  Page {page_num}: {search_url[:120]}")
 
                 page = await recover_page(ctx, page)
+
+                # Safety check before search
+                stop_reason = await safety_check(page)
+                if stop_reason:
+                    print(f"\n  🛑 {stop_reason} — stopping immediately.")
+                    if stop_reason == "CAPTCHA_DETECTED":
+                        print("  LinkedIn is showing a CAPTCHA. Solve it manually and try again later.")
+                    elif stop_reason == "RATE_LIMIT_REACHED":
+                        print("  LinkedIn has rate-limited your account. Wait 24-48 hours before retrying.")
+                    await ctx.close()
+                    return
+
                 cards = await get_cards_from_page(page, search_url)
 
                 if not cards:
@@ -802,6 +926,17 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
                         skip_no_connect += 1
                         page = await recover_page(ctx, page)
                         continue
+
+                    # Safety check after profile interaction
+                    stop_reason = await safety_check(page)
+                    if stop_reason:
+                        print(f"\n  🛑 {stop_reason} — stopping immediately.")
+                        if stop_reason == "CAPTCHA_DETECTED":
+                            print("  LinkedIn is showing a CAPTCHA. Solve it manually and try again later.")
+                        elif stop_reason == "RATE_LIMIT_REACHED":
+                            print("  LinkedIn has rate-limited your account. Wait 24-48 hours before retrying.")
+                        await ctx.close()
+                        return
 
                     if not name and confirmed_name:
                         name = confirmed_name
@@ -856,6 +991,99 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+async def check_acceptance():
+    """
+    Visit profiles in the sent log and check if they accepted the connection.
+    Updates the CSV with acceptance status.
+    """
+    if not SENT_LOG.exists():
+        print("No sent log found.")
+        return
+
+    rows = []
+    with open(SENT_LOG, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        if "accepted" not in fieldnames:
+            fieldnames.append("accepted")
+        for row in reader:
+            rows.append(row)
+
+    # Only check rows that haven't been marked yet
+    unchecked = [r for r in rows if r.get("accepted", "") == ""]
+    if not unchecked:
+        print("All connections already checked.")
+        stats = compute_acceptance_stats({})
+        print(f"\n  Total sent   : {stats['total']}")
+        print(f"  Accepted     : {stats['accepted']}")
+        print(f"  Pending      : {stats['pending']}")
+        print(f"  Accept rate  : {stats['rate']:.1f}%")
+        return
+
+    print(f"\nChecking {len(unchecked)} pending connections...")
+
+    async with async_playwright() as pw:
+        ctx = await launch_browser(pw)
+        page = await ctx.new_page()
+        await ensure_logged_in(page)
+
+        checked = 0
+        for row in unchecked:
+            url = row["profile_url"]
+            name = row.get("name", "?")
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                await asyncio.sleep(random.uniform(2, 3.5))
+
+                # Check for "Message" button (= connected / 1st degree)
+                msg_btn = await page.query_selector(
+                    'button:has-text("Message"), a:has-text("Message")'
+                )
+                if msg_btn and await msg_btn.is_visible():
+                    row["accepted"] = "yes"
+                    print(f"  ✓ {name} — accepted")
+                else:
+                    # Check if still pending
+                    pending_btn = await page.query_selector(
+                        'button:has-text("Pending"), button[aria-label*="Pending" i]'
+                    )
+                    if pending_btn and await pending_btn.is_visible():
+                        row["accepted"] = "pending"
+                        print(f"  ⏳ {name} — still pending")
+                    else:
+                        row["accepted"] = "no"
+                        print(f"  ✗ {name} — not connected (declined/withdrawn)")
+
+                checked += 1
+                await asyncio.sleep(random.uniform(2, 4))
+
+            except Exception as e:
+                print(f"  ? {name} — error checking: {e}")
+
+        await ctx.close()
+
+    # Rewrite CSV with updated acceptance status
+    with open(SENT_LOG, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    stats = compute_acceptance_stats({})
+    print(f"\n{'='*50}")
+    print(f"  Checked      : {checked}")
+    print(f"  Total sent   : {stats['total']}")
+    print(f"  Accepted     : {stats['accepted']}")
+    print(f"  Pending      : {stats['pending']}")
+    print(f"  Accept rate  : {stats['rate']:.1f}%")
+
+    if stats['rate'] < 30 and stats['total'] >= 20:
+        print(f"\n  ⚠️  WARNING: Acceptance rate is below 30%.")
+        print(f"  LinkedIn may restrict your account. Consider:")
+        print(f"    - Reducing daily volume")
+        print(f"    - Improving your profile/headline")
+        print(f"    - Targeting more relevant connections")
+
+
 async def test_profile(url: str, skip_title_filter: bool = False, send: bool = False):
     """Test the connect flow on a single profile URL — useful for debugging."""
     async with async_playwright() as pw:
@@ -894,9 +1122,29 @@ def main():
         "--send", action="store_true",
         help="Used with --test-profile: actually send the connection request (default is dry-run)"
     )
+    parser.add_argument(
+        "--check-acceptance", action="store_true",
+        help="Check which sent connections were accepted and show acceptance rate stats"
+    )
+    parser.add_argument(
+        "--stats", action="store_true",
+        help="Show quick stats from the CSV without visiting LinkedIn"
+    )
     args = parser.parse_args()
 
-    if args.test_profile:
+    if args.stats:
+        stats = compute_acceptance_stats({})
+        sent_log = load_sent_log()
+        print(f"\nLinkedIn Connector — Stats")
+        print(f"  Total sent     : {stats['total']}")
+        print(f"  Accepted       : {stats['accepted']}")
+        print(f"  Pending        : {stats['pending']}")
+        print(f"  Accept rate    : {stats['rate']:.1f}%")
+        print(f"  Sent today     : {count_sent_today(sent_log)}")
+        print(f"  Sent this week : {count_sent_this_week(sent_log)}")
+    elif args.check_acceptance:
+        asyncio.run(check_acceptance())
+    elif args.test_profile:
         asyncio.run(test_profile(args.test_profile, skip_title_filter=args.any_role, send=args.send))
     else:
         asyncio.run(run(args.limit, args.dry_run, skip_title_filter=args.any_role))
