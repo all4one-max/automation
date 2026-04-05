@@ -95,6 +95,26 @@ test("Daily limit = 0 stops even if weekly has room", cap3 == 0)
 cap4 = min(50, DAILY_LIMIT - 0, WEEKLY_LIMIT - 0)
 test("Fresh day/week → full session available", cap4 == 50)
 
+print("\n── is_india word boundary fix ──")
+test("Indianapolis NOT matched", is_india("Indianapolis, Indiana") == False)
+test("Indiana NOT matched", is_india("Indiana, United States") == False)
+test("India still matched", is_india("Mumbai, India") == True)
+test("Indian city still matched", is_india("Bangalore, India") == True)
+test("Noida matched", is_india("Noida, Uttar Pradesh") == True)
+
+print("\n── Viewport rotation ──")
+from linkedin_connector import VIEWPORTS
+test("Multiple viewports available", len(VIEWPORTS) >= 3)
+test("All viewports have width/height", all("width" in v and "height" in v for v in VIEWPORTS))
+test("Viewports are varied", len(set(v["width"] for v in VIEWPORTS)) > 1)
+
+print("\n── Dead code removed ──")
+import inspect, linkedin_connector
+all_funcs = [name for name, _ in inspect.getmembers(linkedin_connector, inspect.isfunction)]
+test("get_connect_buttons_from_page removed", "get_connect_buttons_from_page" not in all_funcs)
+test("human_scroll exists", "human_scroll" in [name for name, _ in inspect.getmembers(linkedin_connector, inspect.iscoroutinefunction)])
+test("human_move_and_click exists", "human_move_and_click" in [name for name, _ in inspect.getmembers(linkedin_connector, inspect.iscoroutinefunction)])
+
 print(f"\n{'='*50}")
 print(f"  Passed: {passed}")
 print(f"  Failed: {failed}")

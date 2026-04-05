@@ -41,10 +41,32 @@ import argparse
 import csv
 import random
 import re
+import signal
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
 from playwright.async_api import async_playwright, Page
+
+# ── Graceful shutdown ────────────────────────────────────────────────────────
+_browser_ctx = None  # set during run() so signal handler can close it
+
+def _handle_shutdown(signum, frame):
+    """Handle Ctrl+C gracefully — close browser context and exit cleanly."""
+    print("\n\n  Ctrl+C detected — shutting down gracefully...")
+    if _browser_ctx:
+        # Schedule async close
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_browser_ctx.close())
+        except Exception:
+            pass
+    print("  Browser closed. Goodbye.\n")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _handle_shutdown)
+signal.signal(signal.SIGTERM, _handle_shutdown)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -72,6 +94,15 @@ RATE_LIMIT_SIGNALS = [
     "withdraw pending invitations",
     "temporarily restricted",
     "your account is restricted",
+]
+
+# ── Viewport rotation (pick one randomly per session) ────────────────────────
+VIEWPORTS = [
+    {"width": 1280, "height": 900},
+    {"width": 1366, "height": 768},
+    {"width": 1440, "height": 900},
+    {"width": 1536, "height": 864},
+    {"width": 1280, "height": 800},
 ]
 
 TARGET_TITLES = [
@@ -213,9 +244,15 @@ def compute_acceptance_stats(sent_log: dict) -> dict:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def is_india(*fields: str) -> bool:
-    """Check any number of text fields (location, title, headline) for India signals."""
+    """Check any number of text fields (location, title, headline) for India signals.
+    Uses word-boundary matching to avoid false positives (e.g. 'Indian' matching 'Indianapolis, Indiana').
+    """
     combined = " ".join(f.lower() for f in fields if f)
-    return any(t in combined for t in INDIA_TOKENS)
+    for t in INDIA_TOKENS:
+        # Use regex word boundaries to avoid substring false positives
+        if re.search(r'\b' + re.escape(t) + r'\b', combined):
+            return True
+    return False
 
 
 async def check_for_captcha(page: Page) -> bool:
@@ -257,6 +294,35 @@ async def safety_check(page: Page) -> str | None:
     return None
 
 
+async def human_scroll(page: Page, times: int = None):
+    """Scroll the page with human-like variation in distance, speed, and count."""
+    scroll_count = times or random.randint(4, 8)
+    for _ in range(scroll_count):
+        distance = random.randint(300, 800)
+        await page.evaluate(f"window.scrollBy(0, {distance})")
+        await asyncio.sleep(random.uniform(0.3, 1.0))
+    await asyncio.sleep(random.uniform(1.0, 2.0))
+
+
+async def human_move_and_click(page: Page, element, timeout: int = 10000):
+    """Move mouse to element with a slight offset, pause briefly, then click."""
+    try:
+        box = await element.bounding_box()
+        if box:
+            # Add slight random offset within the element
+            x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+            y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+            # Move mouse in steps (not instant teleport)
+            await page.mouse.move(x, y, steps=random.randint(5, 15))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+            await page.mouse.click(x, y)
+        else:
+            # Fallback to direct click if bounding box unavailable
+            await element.click(timeout=timeout)
+    except Exception:
+        await element.click(timeout=timeout)
+
+
 def build_search_url(keyword: str, page_num: int = 1) -> str:
     import urllib.parse
     # geoUrn must be raw (not double-encoded) — LinkedIn parses it as a JSON array in the URL
@@ -272,6 +338,8 @@ def build_search_url(keyword: str, page_num: int = 1) -> str:
 # ── Browser setup ─────────────────────────────────────────────────────────────
 
 async def launch_browser(playwright):
+    viewport = random.choice(VIEWPORTS)
+    print(f"  Viewport     : {viewport['width']}x{viewport['height']}")
     ctx = await playwright.chromium.launch_persistent_context(
         user_data_dir=str(USER_DATA),
         headless=False,
@@ -281,7 +349,7 @@ async def launch_browser(playwright):
             "--no-default-browser-check",
             "--disable-blink-features=AutomationControlled",
         ],
-        viewport={"width": 1280, "height": 900},
+        viewport=viewport,
         locale="en-US",
         timezone_id="America/New_York",
     )
@@ -324,10 +392,7 @@ async def get_cards_from_page(page: Page, search_url: str) -> list[dict]:
     await page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
     await asyncio.sleep(random.uniform(3, 5))
 
-    for _ in range(6):
-        await page.evaluate("window.scrollBy(0, 600)")
-        await asyncio.sleep(random.uniform(0.4, 0.7))
-    await asyncio.sleep(1.5)
+    await human_scroll(page)
 
     cards = await page.evaluate("""
     () => {
@@ -451,6 +516,7 @@ async def handle_connect_modal(page: Page) -> bool:
             continue
 
     if not modal:
+        # Don't assume success — check for a success toast first
         try:
             toast = await page.wait_for_selector(
                 '[data-test-artdeco-toast-item], .artdeco-toast-item, [role="alert"]',
@@ -462,7 +528,9 @@ async def handle_connect_modal(page: Page) -> bool:
                     return True
         except Exception:
             pass
-        return True  # Assume auto-sent
+        # No modal AND no success toast — can't confirm the request was sent
+        print("    [warning] No modal or success toast detected — not counting as sent")
+        return False
 
     await asyncio.sleep(0.8)
 
@@ -479,7 +547,7 @@ async def handle_connect_modal(page: Page) -> bool:
             break
 
     if send_btn:
-        await send_btn.click()
+        await human_move_and_click(page, send_btn)
         await asyncio.sleep(random.uniform(1.5, 2.5))
         return True
 
@@ -519,7 +587,7 @@ async def send_connection_on_profile(
         return False, "", ""
 
     try:
-        await page.evaluate("window.scrollBy(0, 300)")
+        await page.evaluate(f"window.scrollBy(0, {random.randint(200, 500)})")
     except Exception:
         pass
     await asyncio.sleep(1)
@@ -659,8 +727,8 @@ async def send_connection_on_profile(
         # Click More and wait for dropdown
         await more_btn.scroll_into_view_if_needed()
         await asyncio.sleep(random.uniform(0.5, 1))
-        await more_btn.click()
-        await asyncio.sleep(2.5)   # give dropdown time to fully open
+        await human_move_and_click(page, more_btn)
+        await asyncio.sleep(random.uniform(2.0, 3.0))   # give dropdown time to fully open
 
         # Search for Connect inside the dropdown — click immediately while it's open
         dropdown_clicked = False
@@ -710,97 +778,11 @@ async def send_connection_on_profile(
 
     await connect_btn.scroll_into_view_if_needed()
     await asyncio.sleep(random.uniform(0.5, 1.2))
-    await connect_btn.click(timeout=10000)
+    await human_move_and_click(page, connect_btn)
     await asyncio.sleep(random.uniform(1.5, 2.5))
 
     success = await handle_connect_modal(page)
     return success, name, location
-
-
-# ── Search-page connect buttons ───────────────────────────────────────────────
-
-async def get_connect_buttons_from_page(page: Page) -> list[tuple]:
-    """
-    Scan the current search results page for visible Connect buttons.
-    For each one, walk up the DOM to find the profile URL, name, location, title.
-    Returns list of (playwright_button_handle, info_dict).
-    Only returns buttons that are visible — profiles without a visible Connect
-    button on the search card are skipped entirely (no profile page visit).
-    """
-    # Scroll to load all cards
-    for _ in range(6):
-        await page.evaluate("window.scrollBy(0, 500)")
-        await asyncio.sleep(random.uniform(0.3, 0.5))
-    await asyncio.sleep(1.5)
-
-    # Cast a wide net — LinkedIn uses aria-label OR plain text depending on UI version
-    buttons = await page.query_selector_all(
-        'button[aria-label*="connect" i], '
-        'button[aria-label*="Invite" i], '
-        'button:has-text("Connect")'
-    )
-    print(f"    [debug] raw buttons found by selector: {len(buttons)}")
-
-    results = []
-    seen_btns: set[int] = set()
-    for btn in buttons:
-        btn_id = id(btn)
-        if btn_id in seen_btns:
-            continue
-        seen_btns.add(btn_id)
-
-        if not await btn.is_visible():
-            continue
-
-        # Accept any button whose text contains "connect" (handles "+ Connect", "Connect", etc.)
-        btn_text = (await btn.inner_text()).strip()
-        if "connect" not in btn_text.lower():
-            continue
-
-        info = await page.evaluate("""
-        (btn) => {
-            let el = btn;
-            for (let i = 0; i < 15; i++) {
-                el = el.parentElement;
-                if (!el) break;
-                const links = el.querySelectorAll('a[href*="/in/"]');
-                for (const link of links) {
-                    const m = link.href.match(/linkedin\\.com\\/in\\/([^/?#]+)/);
-                    if (!m || /^\\d+$/.test(m[1])) continue;
-
-                    const lines = (el.innerText || '')
-                        .split('\\n').map(l => l.trim()).filter(Boolean);
-                    const name = lines[0] || '';
-                    if (!name || /skip|home|notification/i.test(name)) continue;
-
-                    let location = '';
-                    for (const l of lines) {
-                        if (l.includes(',') && l.length < 60 &&
-                            !l.includes(' at ') && !l.includes('mutual')) {
-                            location = l; break;
-                        }
-                    }
-                    let title = '';
-                    for (const l of lines) {
-                        if (l.includes(' at ') && l.length < 120) { title = l; break; }
-                    }
-
-                    return {
-                        profile_url: 'https://www.linkedin.com/in/' + m[1] + '/',
-                        name,
-                        location,
-                        title,
-                    };
-                }
-            }
-            return null;
-        }
-        """, btn)
-
-        if info and info.get("profile_url"):
-            results.append((btn, info))
-
-    return results
 
 
 # ── Main runner ───────────────────────────────────────────────────────────────
@@ -844,11 +826,18 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
     seen_this_run: set[str] = set()
 
     async with async_playwright() as pw:
+        global _browser_ctx
         ctx  = await launch_browser(pw)
+        _browser_ctx = ctx  # for graceful shutdown on Ctrl+C
         page = await ctx.new_page()
         await ensure_logged_in(page)
 
-        for keyword in TARGET_TITLES:
+        # Shuffle keyword order each run to avoid predictable search patterns
+        keywords = TARGET_TITLES.copy()
+        random.shuffle(keywords)
+        print(f"  Search order : {', '.join(keywords)}\n")
+
+        for keyword in keywords:
             if sent_count >= session_cap and not dry_run:
                 break
 
@@ -959,9 +948,15 @@ async def run(session_limit: int, dry_run: bool, skip_title_filter: bool = False
                         print(f"    – Connect unavailable (Follow-only / already connected / pending)")
                         continue   # no wait needed — nothing was sent
 
-                    delay = random.uniform(10, 20)
-                    print(f"    Waiting {delay:.0f}s …")
-                    await asyncio.sleep(delay)
+                    # Occasional long "distraction" break every 8-15 requests
+                    if sent_count > 0 and sent_count % random.randint(8, 15) == 0:
+                        long_break = random.uniform(60, 120)
+                        print(f"    ☕ Taking a {long_break:.0f}s break (human-like pause) …")
+                        await asyncio.sleep(long_break)
+                    else:
+                        delay = random.uniform(10, 20)
+                        print(f"    Waiting {delay:.0f}s …")
+                        await asyncio.sleep(delay)
 
                 # Paginate — recover page first in case it closed
                 page = await recover_page(ctx, page)
